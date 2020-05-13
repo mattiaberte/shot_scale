@@ -1,0 +1,249 @@
+
+google.colab import drive
+drive.mount('/content/drive')
+
+
+
+import matplotlib.pyplot as plt
+import sys
+import os
+import keras                           
+from keras.models import Model           
+from keras.optimizers import Adam        
+from keras.layers import Dense, Flatten  
+from keras import backend as K           
+from keras.callbacks import ReduceLROnPlateau, EarlyStopping
+import numpy as np
+import warnings
+from keras import regularizers
+from keras.layers.advanced_activations import PReLU
+from keras.preprocessing.image import ImageDataGenerator
+import argparse
+import tensorflow as tf
+import traceback
+import itertools
+from keras.applications import densenet, VGG16
+        
+import logging
+from tensorboardcolab import TensorBoardColab as tbc
+from tensorboardcolab import TensorBoardColabCallback
+from sklearn.metrics import classification_report, confusion_matrix
+
+
+warnings.filterwarnings("ignore", category=UserWarning)
+print(K.backend())    # imposta tensor flow come backend engine
+config = tf.compat.v1.ConfigProto()
+config.gpu_options.allow_growth = True # evita che TensorFlow occupi tutta la GPU inutilmente
+# config.gpu_options.per_process_gpu_memory_fraction = 0.7
+session = tf.compat.v1.Session(config=config)
+
+
+
+parser = argparse.ArgumentParser(description='train DenseNet.')
+parser.add_argument('--nb_dense_block', help='number of dense blocks to add to end (generally = 3)', type=int,
+                    default=9)
+parser.add_argument('--log', help='log name', type=str, default='DenseNet8')
+parser.add_argument('--growth_rate', help='number of filters to add per dense block', type=int, default=13)
+parser.add_argument('--nb_filter',
+                    help='initial number of filters. -1 indicates initial number of filters is 2 * growth_rate',
+                    type=int, default=-1)
+parser.add_argument('--depth', help='number or layers in the DenseNet', type=int, default="40")
+parser.add_argument('--dropout_rate', help='dropout rate', type=float, default="0.")
+parser.add_argument('--epoch', help='number of epoch', type=int, default=10)
+parser.add_argument('--segment_dim', help='segment dimension (default 64)', type=int, default=64) #64
+parser.add_argument('--batch_size', help='', type=int, default=384) #384
+parser.add_argument('--augm', help='Augmentation: 0>off, 1>only flip, 2>flip+homeomorfic', type=int, default=2)
+parser.add_argument('--lr', help='learing rate', type=float, default=1e-4)
+parser.add_argument('--initial_epoch',
+                    help='Epoch at which to start training (useful for resuming a previous training run)', type=int,
+                    default=0)
+parser.add_argument('--test', dest='test',
+                    help='test mode.save debug in the end',
+                    action='store_true')
+parser.add_argument('--weights', help='', type=str, default='')
+parser.add_argument("-f", "--fff", help="a dummy argument to fool ipython", default="1")
+
+
+args = parser.parse_args() # return an object with a number of attribute that depends on .add_argument and containing
+                           # the result of the function specified above
+
+log_name = args.log
+print(log_name)
+outname = '{}_depth{}_ndense{}_gr{}_do{}_bs{}_dim{}_augm{}'.format(log_name, args.depth, args.nb_dense_block,
+                                                            args.growth_rate, args.dropout_rate, args.batch_size,
+                                                            args.segment_dim, args.augm)
+
+print("========= TEST MODE ==========")
+
+current_dir = os.getcwd()
+os.chdir(current_dir)
+
+train_path = '/content/drive/My Drive/Thesis/ShotScale/dataset/whole/train/'
+resized_train_path = '/content/drive/My Drive/Thesis/ShotScale/dataset/resized_2/train/'
+train_3 = '/content/drive/My Drive/Thesis/ShotScale/dataset/resized_3/train/'
+val_path = '/content/drive/My Drive/Thesis/ShotScale/dataset/whole/val/'
+resized_val_path = '/content/drive/My Drive/Thesis/ShotScale/dataset/resized_2/val/'
+val_3 = '/content/drive/My Drive/Thesis/ShotScale/dataset/resized_3/val/'
+models_path = '/content/drive/My Drive/Thesis/ShotScale/models/'
+log_path = '/content/drive/My Drive/Thesis/ShotScale/log/'
+f_weights = args.weights
+print('weights ', f_weights)
+batch_size = args.batch_size
+print('batch_size ', batch_size)
+start_lr = args.lr
+print('start_lr ', start_lr)
+nb_classes = 8
+nb_epoch = args.epoch
+print('epoch ', nb_epoch)
+box_increase = 0.10
+dim = args.segment_dim
+print('segment_dim ', dim)
+depth = args.depth
+print('depth ', depth)
+nb_dense_block = args.nb_dense_block
+print('dense block ', nb_dense_block)
+growth_rate = args.growth_rate
+print('growth rate ', growth_rate)
+nb_filter = args.nb_filter
+print('nb filter ', nb_filter)
+dropout_rate = args.dropout_rate
+print('dropout ', dropout_rate)
+input_shape = (dim, dim)
+augm = args.augm
+print('augm ', augm)
+print(args.test)
+
+print("=" * 30)
+print("===== Start training mode =====")
+print("Batch size: {} \nlr: {} \nepoch: {}"
+      "\noutname: {}".format(batch_size, start_lr, nb_epoch, outname))
+print("=" * 30)
+
+"""
+model = densenet.DenseNet(input_shape + (3,),
+                          classes=nb_classes,
+                          depth=depth,
+                          nb_dense_block=nb_dense_block,
+                          growth_rate=growth_rate,
+                          nb_filter=nb_filter,
+                          dropout_rate=dropout_rate,
+                          weight_decay=1e-4,
+                          bottleneck=True,
+                          reduction=0.5,
+                          weights=None)
+"""
+"""
+base_model = keras.applications.densenet.DenseNet121(input_shape=input_shape + (3,),
+                        #bottleneck=True,
+                        #reduction=0.5,
+                        #dropout_rate=dropout_rate,
+                        #weight_decay=1e-4,
+                        include_top=False,
+                        weights='imagenet')
+
+"""
+base_model = VGG16(input_shape=input_shape + (3,),
+                   include_top=False,
+                   weights='imagenet')
+     
+
+# Classification block
+
+x = base_model.output
+x = Flatten(name='flatten')(x) # Trasforma la matrice(MxN) in un vettore lungo MxN
+x = Dense(1024, activation= 'relu', name='fc1')(x)
+x = Dense(1024, activation= 'relu', name='fc2')(x) # output dimension 1024
+x_class = Dense(nb_classes, activation='softmax', name='predictions')(x) #softmax is the extension of sigmoid
+model = Model(base_model.input, x_class)                                 #for multiclass classifier
+
+for layer in model.layers:
+      layer.trainable = True
+for layer in base_model.layers:
+      layer.trainable = True
+
+logging.info("Model created")
+model.summary()
+optimizer = Adam(lr=start_lr)  # Using Adam instead of SGD to speed up training
+model.compile(loss='categorical_crossentropy', optimizer=optimizer, metrics=["acc"])
+logging.info("Finished compiling")
+logging.info("Building model...")
+
+if f_weights:
+    model.load_weights(os.path.join(models_path, f_weights))
+
+
+if not args.test:
+     multiply = lambda x: np.clip(x * 3, 0, 255)  # clip restituisce x con tutti i valori riportati all'intero di [0, 255]
+     train_datagen = ImageDataGenerator(rotation_range=5,  # Int. Degree range for random rotations.
+                                       width_shift_range=0.1,
+                                       # Float (fraction of total width). Range for random horizontal shifts.
+                                       height_shift_range=0.1,
+                                       shear_range=0.05,
+                                       # Float. Shear Intensity (Shear angle in counter-clockwise direction as radians)
+                                       zoom_range=0.05,
+                                       channel_shift_range=0.,  # Float. Range for random channel shifts.
+                                       fill_mode='nearest',
+                                       horizontal_flip=True,
+                                       vertical_flip=False,
+                                       rescale=1. / 255,
+                                       # rescaling factor. Defaults to None. If None or 0, no rescaling is applied, otherwise we multiply the data by the value provided (before applying any other transformation).
+                                       data_format='channels_last'
+                                       )
+
+     test_datagen = ImageDataGenerator(rescale=1. / 255,
+                                      data_format='channels_last'
+                                      )
+
+     train_generator = train_datagen.flow_from_directory(
+        #resized_train_path,
+        train_3,
+        target_size=input_shape,
+        batch_size=batch_size,
+        class_mode='categorical',
+     )
+
+     validation_generator = test_datagen.flow_from_directory(
+         #resized_val_path,
+         val_3,
+         target_size=input_shape,
+         batch_size=batch_size,
+         class_mode='categorical',
+         shuffle = False
+     )
+
+     steps_per_epoch = int(train_generator.samples / batch_size)
+
+     log_dir = os.path.join(log_path, outname)
+     if os.path.exists(log_dir) == False :
+         os.makedirs(log_dir)
+     model.save(os.path.join(models_path, outname + 'start.h5'))
+
+
+     lr_reducer = ReduceLROnPlateau(monitor='val_acc', factor=np.sqrt(0.1), cooldown=2, patience=2, min_lr=1e-6)
+    # reduce the learning rate if it stagnates
+     early_stopper = EarlyStopping(monitor='acc', min_delta=0.001, patience=6)
+
+     
+
+     model.fit_generator(train_generator, steps_per_epoch=steps_per_epoch, nb_epoch=nb_epoch,
+                        nb_worker=2, pickle_safe=True, verbose=1,
+                        validation_data=validation_generator, validation_steps=12000 / batch_size,   
+                        # class_weight={0: pos_neg_ratio, 1: 1},
+                        # Dictionary mapping class indices to a weight for the class.
+                        max_q_size=100,  # Maximum size for the generator queue
+                        callbacks=[lr_reducer,
+                                   keras.callbacks.ModelCheckpoint(os.path.join(models_path,
+                                                                                outname + '.{epoch:02d}-{acc:.3f}.h5'),
+                                                                   monitor='val_acc',
+                                                                   verbose=1, save_best_only=True,
+                                                                   save_weights_only=True , mode='auto',  
+                                                                   period=1),
+                                   keras.callbacks.TensorBoard(log_dir=log_dir)],
+                        initial_epoch=args.initial_epoch
+                            # Epoch at which to start training (useful for resuming a previous training run)
+                        )
+     print(("Training ended, save model in %s" % os.path.join(models_path, outname + 'end.h5')))
+     model.save(os.path.join(models_path, outname + 'end.h5'))
+     print('End')
+
+
